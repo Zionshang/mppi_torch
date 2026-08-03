@@ -50,6 +50,7 @@ class MPPIConfig(object):
         :param u_max: (nu) maximum values for each dimension of control to pass into dynamics
         :param u_init: (nu) what to initialize new end of trajectory control to be; defeaults to zero
         :param U_init: (T x nu) initial control sequence; defaults to noise
+        :param u_per_command: number of leading controls returned and shifted before the next planning call
         :param rollout_var_discount: Discount cost over control horizon
         :param sample_null_action: Whether to explicitly sample a null action (bad for starting in a local minima)
         :param noise_abs_cost: Whether to use the absolute value of the action noise to avoid bias when all states have the same cost   
@@ -121,6 +122,10 @@ class MPPIPlanner(ABC):
         self.sample_null_action = cfg.sample_null_action
         self.sample_previous_plan = cfg.sample_previous_plan
         self.sample_other_priors = cfg.sample_other_priors
+        if not isinstance(cfg.u_per_command, int) or not 1 <= cfg.u_per_command <= self.T:
+            raise ValueError(
+                f"u_per_command must be an integer in [1, {self.T}], got {cfg.u_per_command!r}"
+            )
         self.u_per_command = cfg.u_per_command
         self.terminal_state_cost = None
         self.update_lambda = cfg.update_lambda
@@ -227,6 +232,16 @@ class MPPIPlanner(ABC):
     def _running_cost(self, state):
         return self.running_cost(state)
 
+    def _shift_action_sequence(self, sequence):
+        """Advance a warm-start sequence by the number of returned controls."""
+        # The halton mean is a single action vector before its first update.
+        if sequence.ndim < 2:
+            return sequence
+        tail_action = sequence[-1].clone()
+        sequence = torch.roll(sequence, -self.u_per_command, dims=0)
+        sequence[-self.u_per_command :] = tail_action
+        return sequence
+
     def _exp_util(self, costs, actions):
         """
            Calculate weights using exponential utility given cost
@@ -291,7 +306,7 @@ class MPPIPlanner(ABC):
         self.state = state.to(dtype=self.tensor_args['dtype'], device=self.tensor_args['device'])
 
         if self.mppi_mode == 'simple':
-            self.U = torch.roll(self.U, -1, dims=0)
+            self.U = self._shift_action_sequence(self.U)
             cost_total = self._compute_total_cost_batch_simple()
 
             beta = torch.min(cost_total)
@@ -305,10 +320,7 @@ class MPPIPlanner(ABC):
             action = self.U
 
         elif self.mppi_mode == 'halton-spline':
-            # shift command 1 time step
-            saved_action = self.mean_action[-1]
-            self.mean_action = torch.roll(self.mean_action, -1, dims=0)
-            self.mean_action[-1] = saved_action
+            self.mean_action = self._shift_action_sequence(self.mean_action)
             cost_total = self._compute_total_cost_batch_halton()
               
             action = torch.clone(self.mean_action)
@@ -340,9 +352,11 @@ class MPPIPlanner(ABC):
             else:
                 action = torch.from_numpy(u_filtered).to('cuda')
         
-        # Reduce dimensionality if we only need the first command
+        # Return exactly the controls that the caller will execute before replanning.
         if self.u_per_command == 1:
             action = action[0]
+        else:
+            action = action[: self.u_per_command]
 
         return action
 
